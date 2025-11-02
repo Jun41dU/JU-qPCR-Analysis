@@ -1,0 +1,570 @@
+library(dplyr)
+library(ggplot2)
+library(readr)
+library(ggpubr)
+library(tidyr)
+library(broom)
+library(ggrepel)
+library(ggpattern)
+#I repeat the libraries cause for some reason they never run the first time on VSCODE >:(
+library(dplyr)
+library(ggplot2)
+library(readr)
+library(ggpubr)
+library(tidyr)
+library(broom)
+library(ggrepel)
+library(ggpattern)
+
+pcr_data <- read_csv("2025 PCR Results.csv", col_types = cols())
+pcr_data_NTC <- filter(pcr_data, grepl("NTC", pcr_data$Sample))
+
+# 1. Remove Undetermined Cqs and turn them to NAs which work with R
+pcr_data_clean <- pcr_data %>%
+  mutate(Cq = as.numeric(Cq))  # Gets rid of Undetermined and replaces with NA
+
+# 2. Look into the NTCs and compare to weakest positive samples. if Ct from NTC within 7 cycles of cDNA (2^7= 128 fold difference) then flag as risky
+weakest_samples <- pcr_data_clean %>% # cDNA Sample with the highest Cq for each target
+  filter(!is.na(Cq) & !grepl("NTC|STD", Sample)) %>%
+  group_by(Target) %>%
+  summarise(max_sample_Cq = max(Cq))
+
+ntc_risk_assessment <- pcr_data_clean %>%
+  filter(!is.na(Cq) & grepl("NTC", Sample)) %>%
+  left_join(weakest_samples, by = "Target") %>%
+  mutate(
+    Cq_difference = Cq - max_sample_Cq,
+    risk_level = case_when(
+      Cq_difference <= 0 ~ "HIGH RISK",
+      Cq_difference <= 5 ~ "MEDIUM RISK",
+      Cq_difference <= 7 ~ "LOW RISK", 
+      TRUE ~ "NO RISK"
+    )
+  ) %>%
+  select(Target, Sample, Student, Name, Cq, max_sample_Cq, Cq_difference, risk_level) %>%
+  arrange(Target, Cq)
+
+# 3. This just cleans up the ntc_risk_assessment to what we need to left join later.
+ntc_risk_assessment_clean <- ntc_risk_assessment %>%
+	select(Target, Name, risk_level) %>%
+  distinct()
+
+# 4. Prepare standards data, removing high-risk targets entirely
+high_risk_datapoints <- ntc_risk_assessment %>%
+  filter(risk_level == "HIGH RISK") %>%
+  select(Student, Name, Target) %>%
+  distinct()
+
+pcr_data_clean_no_high_risk <- pcr_data_clean %>%
+  group_by(Target, Sample) %>%
+  anti_join(high_risk_datapoints, by = c("Student", "Target"))
+
+std_data <- pcr_data_clean_no_high_risk %>%
+  filter(grepl("STD", Sample)) %>%
+  filter(!is.na(Cq), ) %>%
+  separate(Sample, into = c("type", "dilution"), sep = " ") %>%
+  mutate(
+    #Cq = if_else(is.na(Cq), 51, Cq),
+    dilution = as.numeric(dilution),
+    log_C0 = case_when(
+      dilution == 1 ~ 2,  # STD1 = 100x = 10^2
+      dilution == 2 ~ 1,  # STD2 = 10x = 10^1  
+      dilution == 3 ~ 0   # STD3 = 1x = 10^0
+    ))
+print(std_data, n=123)
+
+# 5. Join the NTC risky datapoints to the rest of the data. Get a summary to calc Z-scores
+std_data_with_risk <- std_data %>%
+  left_join(ntc_risk_assessment_clean, by = c("Target", "Name") ) %>%
+  # For targets not in ntc_risk_assessment, set NO RISK
+  mutate(risk_level = ifelse(is.na(risk_level), "NO RISK", risk_level)) %>%
+  select(Name, Target, log_C0, Cq, risk_level)
+
+
+std_data_with_z <- std_data_with_risk %>%
+  group_by(Target, log_C0) %>%
+  mutate(
+    median_Ct = median(Cq),
+    mad_Ct = mad(Cq, constant = 1.4826),
+    z_score = (Cq - median_Ct) / mad_Ct
+  ) %>%
+  ungroup()
+
+# 6. Calculate standardised residuals, Cook's distance and Z-score for each target. This took so much brainpower ;-;
+
+std_data_with_residuals_cook <- std_data_with_z %>%
+  group_by(Target) %>%  # Only group by Target for regression
+  do({
+    fit <- lm(Cq ~ log_C0, data = .)
+    aug_data <- augment(fit)
+    # Add Cook's D manually since it's not in augment by default
+    aug_data$.cooksd <- cooks.distance(fit)
+    aug_data
+  }) %>%
+  ungroup()
+
+# 7. Join the two together. This is a bit iffy since i think if two results perfectly are the same i think this would break since i group by them BUT i think its fine. I have no clue how else to do it
+
+std_data_hybrid <- std_data_with_z %>%
+  # Join with regression diagnostics
+  left_join(std_data_with_residuals_cook, 
+            by = c("Target", "log_C0", "Cq")) %>%
+  group_by(Target) %>%
+  mutate(
+    z_score_residual_thresholds = case_when(
+      first(risk_level) == "MEDIUM RISK" ~ 2.0,
+      first(risk_level) == "LOW RISK" ~ 2.5,
+      TRUE ~ 3
+    ),
+    cooks_threshold = 4/n(),
+    
+    # Apply BOTH outlier detection methods
+    outlier_z_score = abs(z_score) > z_score_residual_thresholds,
+    outlier_residual = abs(.std.resid) > z_score_residual_thresholds, 
+    outlier_cooks = .cooksd > cooks_threshold,
+    outlier_status = case_when(
+      outlier_cooks ~ "HIGH INFLUENCE OUTLIER (C)",
+      outlier_residual ~ "RESIDUAL OUTLIER (SR)",
+      outlier_z_score ~ "Z-SCORE OUTLIER (Z)", 
+      TRUE ~ "OK"
+    )
+  ) %>%
+  ungroup()
+
+#write.csv(std_data_hybrid, "Standard_Curve_Data_combined.csv", row.names = FALSE)
+
+
+# 8. Remove outliers for final standard curve calculation (not the points plotted but what will form the curve)
+std_data_clean <- std_data_hybrid %>%
+  filter(!grepl("OUTLIER", outlier_status)) 
+
+
+
+# 9. Calculate the m and c using a linear regression model. This isn't used to make the ggplot LOBF itself, but is used for the label on the line 
+Cq_linear_regressions <- std_data_clean %>%
+  group_by(Target) %>%
+  do(model = lm(Cq ~ log_C0, data=.))
+
+inter_grad <- std_data_clean %>%
+  group_by(Target) %>%
+  # tidy from broom does some funny stuff and gets the intercept and slope
+  do(tidy(lm(Cq ~ log_C0, data = .))) %>%
+  select(Target, term, estimate) %>%
+  pivot_wider(names_from = term, values_from = estimate) %>%
+  rename(intercept = `(Intercept)`, slope = log_C0)
+
+# 10. Setup the labels and plot the graph  
+labels_df <- std_data_clean %>%
+  group_by(Target) %>%
+  summarise(
+    x = max(log_C0), # position label at end of x-axis
+    # predicted y value at that x, using each target’s regression
+    y = {model <- lm(Cq ~ log_C0, data = pick(everything()))
+        predict(model, newdata = data.frame(log_C0 = max(log_C0)))[1]},
+    
+  ) %>%
+  left_join(inter_grad, by=c("Target")) %>%
+  mutate(label = paste("y =", round(slope,2), "x +", round(intercept, 2)))
+
+graph <- ggplot(std_data_hybrid, aes(x=log_C0, y = Cq, color = Target)) +
+  theme_classic() + 
+	geom_point(aes(shape = outlier_status), size = 2, stroke = 0.1, color = "grey30") +
+  geom_point(aes(shape = outlier_status), size = 1, alpha = 0.8) +
+	# geom_point(       # If you want to, you can see the datapoints which had a slightly risky NTC by unhashing this
+  #   data = filter(std_data_with_risk, risk_level %in% c("MEDIUM RISK", "LOW RISK")), shape = 21,
+  #   stroke = 1, color = "black") + 
+	geom_smooth(data = std_data_clean, aes(color = Target, group = Target),
+              method = "lm", se = FALSE, linetype = "dashed") +
+  scale_shape_manual(
+     values = c("OK" = 16, "HIGH INFLUENCE OUTLIER (C)" = 4, "RESIDUAL OUTLIER (SR)" = 14, "Z-SCORE OUTLIER (Z)" = 17), # circle 16, triangle 17, cross 4
+     name = "Outlier Status") +
+  geom_text_repel(
+    data = labels_df,
+    aes(x=x, y=y, label=label, color=Target),
+    size = 3,
+    show.legend = FALSE,
+    nudge_x = 0.26
+  ) +
+  # scale_shape_manual(   #used for old Z-score system
+  #   values = c("OK" = 16, "SUSPICIOUS" = 17, "OUTLIER" = 4), # circle 16, triangle 17, cross 4
+  #   name = "Outlier Status") +
+  
+	labs(
+    title = "qPCR Standard Curves (NTC Risk-Adjusted)",
+    subtitle = paste("Removed high-risk likely contaminated results:", 
+                    paste(paste(high_risk_datapoints$Name, high_risk_datapoints$Target, sep="-"), 
+                          collapse=", ")),
+    x = "Log10(Starting Quantity)",
+    y = "Cq Value",
+    color = "Student-Target",
+    shape = "Outlier Status") +
+  scale_x_continuous(breaks = c(0, 1, 2), labels = c("0 (1x)", "1 (10x)", "2 (100x)"))
+graph
+ggsave(
+  filename = paste("ICA_draft_standard_curve_combined.png", sep=""), 
+  plot = graph,
+  dpi = 300,
+  width = 10.5,
+  height = 6.5,
+  units = "in"
+)
+
+# Also make a little standard curve efficiency comparison - probably wont make it to the final paper since its kinda useless
+efficiency_plot <- ggplot(inter_grad, aes(x = Target, y = abs(slope), fill = Target)) +
+  geom_col() +
+  geom_hline(yintercept = 3.32, linetype = "dashed", color = "red") +
+  labs(title = "PCR Efficiency by Target", y = "Slope", 
+       subtitle = "Ideal efficiency = -3.32 (dashed line)") +
+  theme_classic()
+efficiency_plot
+
+ggsave(
+  filename = paste("ICA_std_plot_efficiency.png", sep=""), 
+  plot = heatmap,
+  dpi = 300,
+  width = 12.5,
+  height = 6.5,
+  units = "in"
+)
+
+# 11. Find logC0 and C0, add risk levels, then use a two-tiered approach before doing Z-scores, since there is NA in some data.
+# T1: Remove all NA (undetermined) data that could possibly have biological meaning
+# T2: Used a Censored approach to NA data to allow statistical rigor and possible biological completeness
+# (Pretty much means im gonna do 2 analysis that are slightly tweaked see if there is any difference between them)
+# Using functions since these share a lot of code
+
+cdna_formatter <- function(pcr_data, tier) {
+  cdna_data <- pcr_data %>%
+    filter(grepl("cDNA", Sample)) %>%
+    {
+      if (tier == 1) {
+        filter(., !is.na(Cq))
+      } else if (tier == 2) {
+        mutate(., 
+              Censored = if_else(is.na(Cq), TRUE, FALSE),
+              Cq = if_else(is.na(Cq), 50, Cq),)
+      } else {.}
+    } %>%
+    left_join(inter_grad, by=c("Target")) %>%
+    mutate(log_C0 = (Cq - intercept)/slope,
+           C0 = 10^log_C0
+          ) %>%
+    {if (tier == 1) {
+      select(., Sample, Name, Target, Cq, log_C0, C0)
+      } else {select(., Sample, Name, Target, Cq, Censored, log_C0, C0)}
+    }
+  return(cdna_data)
+}
+
+cdna_risk_joiner <- function(cdna_data, ntc_risk_assessment_clean) {
+  cdna_data_with_risk_levels <- cdna_data %>%
+    left_join(ntc_risk_assessment_clean, by = c("Target", "Name") ) %>%
+    # For targets not in ntc_risk_assessment, set NO RISK
+    mutate(risk_level = ifelse(is.na(risk_level), "NO RISK", risk_level))
+  return(cdna_data_with_risk_levels)
+}
+
+cdna_z_score_assigner <- function(cdna_data_with_risk_levels) {
+  cdna_with_z <- cdna_data_with_risk_levels %>%
+    group_by(Target, Sample) %>%
+    mutate(
+      median_C0 = median(log_C0),
+      mad_C0 = mad(log_C0, constant = 1.4826),
+      z_score = (log_C0 - median_C0) / mad_C0
+    ) %>%
+    ungroup()
+  return(cdna_with_z)
+}
+
+cdna_data_t1 <- cdna_formatter(pcr_data_clean_no_high_risk, tier=1)
+cdna_data_t2 <- cdna_formatter(pcr_data_clean_no_high_risk, tier=2)
+
+cdna_data_with_risk_levels_t1 <- cdna_risk_joiner(cdna_data_t1, ntc_risk_assessment_clean)
+cdna_data_with_risk_levels_t2 <- cdna_risk_joiner(cdna_data_t2, ntc_risk_assessment_clean)
+
+cdna_with_z_t1 <- cdna_z_score_assigner(cdna_data_with_risk_levels_t1)
+cdna_with_z_t2 <- cdna_z_score_assigner(cdna_data_with_risk_levels_t2)
+
+# 12. Remove outliers over z-score threshold for t1. We move the actin to another table then add it to the end of the matching values by Name and Sample
+
+outlier_flagger <- function(cdna_with_z, remove) {
+  #Flags outliers and removes them if remove=TRUE
+  cdna_flagged_outliers <- cdna_with_z %>%
+    mutate(
+    z_score_thresholds = case_when(
+      risk_level == "MEDIUM RISK" ~ 1.5,
+      risk_level == "LOW RISK" ~ 1.75,
+      TRUE ~ 2
+    ),
+    outlier_z_score = abs(z_score) > z_score_thresholds,
+    outlier_status = if_else(outlier_z_score, "OUTLIER", "OK")
+    )
+  
+  cdna_without_outliers <- cdna_flagged_outliers %>%
+    filter(!grepl("OUTLIER", outlier_status)) 
+
+  outliers <- cdna_flagged_outliers %>%
+    filter(!grepl("OK", outlier_status)) 
+  
+  return(list(
+    flagged = cdna_flagged_outliers,
+    cleaned = cdna_without_outliers,
+    outliers = outliers
+  ))
+  }
+
+temp <- outlier_flagger(cdna_with_z_t1, remove=TRUE)
+cdna_flagged_outliers_t1 <- temp$flagged
+cdna_without_outliers_t1 <- temp$cleaned
+cdna_outliers_t1 <- temp$outliers
+
+temp2 <- outlier_flagger(cdna_with_z_t2, remove=TRUE)
+cdna_flagged_outliers_t2 <- temp2$flagged
+cdna_without_outliers_t2 <- temp2$cleaned
+cdna_outliers_t2 <- temp2$outliers
+
+
+write.csv(cdna_flagged_outliers_t2, "cdna_flagged_outliers_data.csv", row.names = FALSE)
+
+# 13. Heatmap to show result of outlier detection and censoring
+
+heatmap_ready <- function(cdna_flagged_outliers, censor=FALSE, add_high_risk=TRUE) {
+  df <- cdna_flagged_outliers %>%
+    mutate(
+      Target = case_when(
+        Target == "ACTIN" ~ "ACT",
+        Target == "VIMENTIN" ~ "VIM",
+        TRUE ~ Target
+      ),
+      Sample = paste(
+        case_when(
+          Sample == "cDNA 1" ~ "AKN1",
+          Sample == "cDNA 2" ~ "CCLP1",
+          Sample == "cDNA 3" ~ "shNOTCH3",
+          TRUE ~ Sample),
+          Target)
+    )
+  # Only apply censor logic if `censor = TRUE` AND column exists
+  if (censor && "Censored" %in% colnames(df)) {
+    df <- df %>%
+      mutate(
+        outlier_status = case_when(
+          Censored == "TRUE" & outlier_status == "OUTLIER" ~ "OUTLIER + Censored",
+          Censored == "TRUE" ~ "Censored",
+          TRUE ~ outlier_status
+        )
+      )
+  }
+  if (add_high_risk) {
+    contam_samples <- c("AKN1", "CCLP1", "shNOTCH3")
+
+    high_risk_rows <- high_risk_datapoints %>%
+      tidyr::expand(Name, Target, Sample = contam_samples) %>% 
+      mutate(
+        Sample = paste(Sample, Target),
+        risk_level = "HIGH RISK",
+        outlier_status = "CONTAMINATED"
+      )
+    # bind, allowing missing cols (newer dplyr)
+    df <- dplyr::bind_rows(df, high_risk_rows)
+  }
+  return(df)
+}
+heatmap_ready_outliers_t1 <- heatmap_ready(cdna_flagged_outliers_t1, censor=FALSE, add_high_risk=TRUE)
+heatmap_ready_outliers_t2 <- heatmap_ready(cdna_flagged_outliers_t2, censor=TRUE, add_high_risk=TRUE)
+
+write.csv(heatmap_ready_outliers_t2, "heatmap_ready_outliers_data.csv", row.names = FALSE)
+
+heatmap <- ggplot(heatmap_ready_outliers_t1, # replace this with t2 and update the labels to get the censored data
+                  aes(x = Sample, y = Name)) +
+  geom_tile_pattern(
+    aes(fill = outlier_status, pattern = outlier_status, pattern_colour = outlier_status),
+    pattern_density = 0.5, pattern_spacing = 0.02, pattern_angle = 45) +
+  scale_fill_manual(values = c("OUTLIER" = "red", "OK" = "green", "Censored" = "grey", "OUTLIER + Censored" = "grey", "CONTAMINATED" = "grey")) +
+  scale_pattern_manual(values = c("OUTLIER" = "none", "OK" = "none", "Censored" = "none", "OUTLIER + Censored" = "stripe", "CONTAMINATED" = "stripe")) +
+  scale_pattern_colour_manual(values = c("OUTLIER" = NA, "OK" = NA, "Censored" = NA, "OUTLIER + Censored" = "red", "CONTAMINATED" = "blue")) +
+  theme_minimal() +
+  labs(title = "NTC Contamination Risk Assessment - Undetermined Removed")
+heatmap
+
+ggsave(
+  filename = paste("ICA_Contamination_risk_assessment_t1.png", sep=""), 
+  plot = heatmap,
+  dpi = 300,
+  width = 12.5,
+  height = 6.5,
+  units = "in"
+)
+
+# 14. Normalise data to actin in two ways: using standard curve data or just the ΔΔCt method before saving to file
+
+normalise_cdna <- function(cdna_without_outliers) {
+  actin_data <- cdna_without_outliers %>%
+    filter(Target == "ACTIN") %>%
+    ungroup() %>%
+    select(Sample, Name, Actin_Cq = Cq,  Actin_C0 = C0)
+
+  cdna_norm_C0 <- cdna_without_outliers %>%
+  filter(Target != "ACTIN") %>%
+  left_join(actin_data, by = c("Sample", "Name")) %>%
+  mutate(
+      # Normal standard curve method 
+      Norm_C0 = C0 / Actin_C0,
+      # Find the ΔCt 
+      delta_ct = Cq - Actin_Cq)
+  return(cdna_norm_C0)
+}
+
+cdna_norm_C0_t1 <- normalise_cdna(cdna_without_outliers_t1)
+cdna_norm_C0_t2 <- normalise_cdna(cdna_without_outliers_t2)
+
+write.csv(cdna_norm_C0_t1, "cdna_normalisation_data.csv", row.names = FALSE)
+write.csv(cdna_norm_C0_t2, "cdna_normalisation_data_censored.csv", row.names = FALSE)
+
+# 15. Generate Fold change data or ΔΔCt 
+
+find_FC_cdelta <- function(cdna_norm_C0) {
+  cell_compare_FC_cdelta <- cdna_norm_C0 %>%
+    mutate(rep = gsub("cDNA ", "", Sample)) %>%
+    ungroup() %>%
+    select(Name, Target, rep, Norm_C0, delta_ct) %>%
+    pivot_wider(
+      names_from = rep,
+      values_from = c(Norm_C0, delta_ct),
+      names_glue = "{.value}_cDNA{rep}"
+    ) %>%
+    mutate(
+      #Standard curve
+      CCLP1_over_AKN1_FC = Norm_C0_cDNA2 / Norm_C0_cDNA1,
+      shCCLP1_over_AKN1_FC = Norm_C0_cDNA3 / Norm_C0_cDNA1,
+      ssCCLP1_over_CCLP1_FC = Norm_C0_cDNA3 / Norm_C0_cDNA2,
+
+      # Find the ΔΔCt and do 2^-ΔΔCt
+      CCLP1_over_AKN1_deltc = 2^-(delta_ct_cDNA2 - delta_ct_cDNA1),
+      shCCLP1_over_AKN1_deltc = 2^-(delta_ct_cDNA3 - delta_ct_cDNA1),
+      ssCCLP1_over_CCLP1_deltc = 2^-(delta_ct_cDNA3 - delta_ct_cDNA2)
+    )
+}
+cell_compare_FC_cdelta_t1 <- find_FC_cdelta(cdna_norm_C0_t1)
+cell_compare_FC_cdelta_t2 <- find_FC_cdelta(cdna_norm_C0_t2)
+
+#write.csv(cell_compare_FC_cdelta_t1, "cdna_fold_change_deltac.csv", row.names = FALSE)
+
+# 16. Get summary of information for easy comparison with graphs
+
+norm_summary_t1 <- cell_compare_FC_cdelta_t1 %>%
+  filter(Target == "VIMENTIN") %>%
+  select(Name, Norm_C0_cDNA1, Norm_C0_cDNA2, Norm_C0_cDNA3, delta_ct_cDNA1, delta_ct_cDNA2, delta_ct_cDNA3)
+
+delta_summary_t1 <- cell_compare_FC_cdelta_t1 %>%
+  filter(Target == "CDH1") %>%
+  select(Name, CCLP1_over_AKN1_deltc, shCCLP1_over_AKN1_deltc, ssCCLP1_over_CCLP1_deltc)
+
+fc_summary_t1 <- cell_compare_FC_cdelta_t1 %>%
+  filter(Target == "VIMENTIN") %>%
+  select(Name, CCLP1_over_AKN1_FC, shCCLP1_over_AKN1_FC, ssCCLP1_over_CCLP1_FC)
+
+print(norm_summary_t1, n = nrow(norm_summary_t1))
+print(delta_summary_t1, n = nrow(delta_summary_t1))
+print(fc_summary_t1, n = nrow(fc_summary_t1))
+
+norm_summary_t2 <- cell_compare_FC_cdelta_t2 %>%
+  filter(Target == "CDH1") %>%
+  select(Name, Norm_C0_cDNA1, Norm_C0_cDNA2, Norm_C0_cDNA3, delta_ct_cDNA1, delta_ct_cDNA2, delta_ct_cDNA3)
+print(norm_summary_t2, n = nrow(norm_summary_t2))
+
+
+# 17. Plot violin plot to see how normalised_C0s are arranged. Add KW and Wilcoxon stat tests to check for significance.
+
+violin_plot_maker <- function(cdna_norm_C0, Gene_Target, labs_title) {
+  norm_C0_group <- cdna_norm_C0 %>%
+    group_by(Name, Sample) %>%
+    filter(Target == Gene_Target) # Change this to see the log_C0 comparisons made
+
+  # Debug stuff
+  cat("Debug info for", Gene_Target, ":\n")
+  cat("Total rows:", nrow(norm_C0_group), "\n")
+  cat("NA values:", sum(is.na(norm_C0_group$Norm_C0)), "\n")
+
+  # Stat Tests
+  kruskal_test <- kruskal.test(Norm_C0 ~ Sample, data = norm_C0_group) # Shows is there any difference between cell lines?
+  pairwise_wilcox <- pairwise.wilcox.test(norm_C0_group$Norm_C0,  # Which specific pairs are different?
+                                         norm_C0_group$Sample,
+                                         p.adjust.method = "BH") # Benjamini-Hochberg correction to control the Flase Discovery Rate (FDR)
+
+  violin_plot <- ggplot(norm_C0_group, aes(x = Sample, y = Norm_C0, fill = Sample)) +
+    geom_violin(alpha = 0.9, trim = FALSE) +
+    geom_boxplot(width = 0.2, alpha = 0.5, outlier.shape = NA) +
+    geom_jitter(width = 0.1, alpha = 1, size = 0.01) +
+    theme_classic() + 
+    scale_fill_manual(values = c("cDNA 1" = "firebrick2", "cDNA 2" = "turquoise2", "cDNA 3" = "palegreen2"),
+                      labels = c("cDNA 1" = "AKN1", "cDNA 2" = "CCLP1", "cDNA 3" = "shNOTCH3")) +
+    scale_x_discrete(labels = c("cDNA 1" = "AKN1", "cDNA 2" = "CCLP1", "cDNA 3" = "shNOTCH3")) +
+    scale_y_log10() +
+    ylab("Norm_C0 (log scale)") +
+    labs(title = labs_title) +
+    stat_compare_means(
+      method = "kruskal.test", 
+      label.y = 0.95,
+      label = "p.format"
+    ) +
+    stat_compare_means(
+      comparisons = list(c("cDNA 1", "cDNA 2"), 
+                        c("cDNA 1", "cDNA 3"),
+                        c("cDNA 2", "cDNA 3")),
+      method = "wilcox.test",
+      label = "p.format",
+      tip.length = 0.01
+    )
+
+  return(list(
+    norm_C0_group = norm_C0_group,
+    violin_plot = violin_plot
+  ))
+}
+
+# When printing the graphs, you may see a warning that some plots aren't being drawn
+# This is fine, these are the results that either the actin or cdh1/vim data was an outlier and removed.
+# If the actin was removed, all of its cDNA x counterparts cannot give a normalised datapoint so are just NA
+violin_plot_vim_t1 <- violin_plot_maker(cdna_norm_C0_t1, "VIMENTIN", "Normalised C0 Violin Plot - Undetermined Removed")
+violin_plot_vim_t1$violin_plot
+
+violin_plot_vim_t2 <- violin_plot_maker(cdna_norm_C0_t2, "VIMENTIN", "Normalised C0 Violin Plot - Censored data")
+violin_plot_vim_t2$violin_plot
+
+violin_plot_cdh1_t1 <- violin_plot_maker(cdna_norm_C0_t1, "CDH1", "Normalised C0 Violin Plot - Undetermined Removed")
+violin_plot_cdh1_t1$violin_plot
+
+violin_plot_cdh1_t2 <- violin_plot_maker(cdna_norm_C0_t2, "CDH1", "Normalised C0 Violin Plot - Censored data")
+violin_plot_cdh1_t2$violin_plot
+
+
+print(violin_plot_vim_t1$norm_C0 %>%
+    select(Name, Sample, Norm_C0, Target),
+  n = nrow(violin_plot_vim_t1$norm_C0))
+print(violin_plot_vim_t2$norm_C0 %>%
+    select(Name, Sample, Norm_C0, Target),
+  n = nrow(violin_plot_vim_t2$norm_C0))
+print(violin_plot_cdh1_t1$norm_C0 %>%
+    select(Name, Sample, Norm_C0, Target),
+  n = nrow(violin_plot_cdh1_t1$norm_C0))
+print(violin_plot_cdh1_t2$norm_C0 %>%
+    select(Name, Sample, Norm_C0, Target),
+  n = nrow(violin_plot_cdh1_t2$norm_C0))
+
+ggsave(
+  filename = paste("violin_plot_t1_cdh1.png", sep=""), plot = violin_plot_cdh1_t1$violin_plot, dpi = 300,
+  width = 6.5,height = 6.5,units = "in"
+)
+ggsave(
+  filename = paste("violin_plot_t2_cdh1.png", sep=""), plot = violin_plot_cdh1_t2$violin_plot, dpi = 300,
+  width = 6.5,height = 6.5,units = "in"
+)
+ggsave(
+  filename = paste("violin_plot_t1_vim.png", sep=""), plot = violin_plot_vim_t1$violin_plot, dpi = 300,
+  width = 6.5,height = 6.5,units = "in"
+)
+ggsave(
+  filename = paste("violin_plot_t2_vim.png", sep=""), plot = violin_plot_vim_t2$violin_plot, dpi = 300,
+  width = 6.5,height = 6.5,units = "in"
+)
