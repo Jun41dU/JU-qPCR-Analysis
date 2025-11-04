@@ -3,7 +3,7 @@ qPCR Analysis pipeline for In Course Assessment (ICA) in New Targets and Drugs i
 
 ## How to Use
 - Download R/R studios
-- Install packages used using install.packages("[package name]")
+- Install [packages] used using install.packages("[package name]")
 
 ## Installed Packages Used are
 - ggpattern_1.2.1
