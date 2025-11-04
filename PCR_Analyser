@@ -112,9 +112,9 @@ std_data_hybrid <- std_data_with_z %>%
   group_by(Target) %>%
   mutate(
     z_score_residual_thresholds = case_when(
-      first(risk_level) == "MEDIUM RISK" ~ 2.0,
-      first(risk_level) == "LOW RISK" ~ 2.5,
-      TRUE ~ 3
+      first(risk_level) == "MEDIUM RISK" ~ 1.5,
+      first(risk_level) == "LOW RISK" ~ 1.75,
+      TRUE ~ 2
     ),
     cooks_threshold = 4/n(),
     
