@@ -6,7 +6,9 @@ library(tidyr)
 library(broom)
 library(ggrepel)
 library(ggpattern)
-#I repeat the libraries cause for some reason they never run the first time on VSCODE >:(
+library(survival)
+library(survminer)
+#I repeat the libraries cause for some reason they never run the first time >:(
 library(dplyr)
 library(ggplot2)
 library(readr)
@@ -15,6 +17,11 @@ library(tidyr)
 library(broom)
 library(ggrepel)
 library(ggpattern)
+library(survival)
+library(survminer)
+library(AER)
+library(emmeans)
+# Discretion: To do this yourself, plug in the data and work step by step, its kinda long
 
 pcr_data <- read_csv("2025 PCR Results.csv", col_types = cols())
 pcr_data_NTC <- filter(pcr_data, grepl("NTC", pcr_data$Sample))
@@ -103,7 +110,8 @@ std_data_with_residuals_cook <- std_data_with_z %>%
   }) %>%
   ungroup()
 
-# 7. Join the two together. This is a bit iffy since i think if two results perfectly are the same i think this would break since i group by them BUT i think its fine. I have no clue how else to do it
+# 7. Join the two together. This is a bit iffy since if two results perfectly are the same i think this would break since i group by them.
+# BUT for this dataset its fine i hope
 
 std_data_hybrid <- std_data_with_z %>%
   # Join with regression diagnostics
@@ -132,15 +140,13 @@ std_data_hybrid <- std_data_with_z %>%
   ungroup()
 
 #write.csv(std_data_hybrid, "Standard_Curve_Data_combined.csv", row.names = FALSE)
-
-
+ 
 # 8. Remove outliers for final standard curve calculation (not the points plotted but what will form the curve)
 std_data_clean <- std_data_hybrid %>%
   filter(!grepl("OUTLIER", outlier_status)) 
 
-
-
 # 9. Calculate the m and c using a linear regression model. This isn't used to make the ggplot LOBF itself, but is used for the label on the line 
+
 Cq_linear_regressions <- std_data_clean %>%
   group_by(Target) %>%
   do(model = lm(Cq ~ log_C0, data=.))
@@ -161,10 +167,10 @@ labels_df <- std_data_clean %>%
     # predicted y value at that x, using each target’s regression
     y = {model <- lm(Cq ~ log_C0, data = pick(everything()))
         predict(model, newdata = data.frame(log_C0 = max(log_C0)))[1]},
-    
+    r_squared = summary(lm(Cq ~ log_C0, data = pick(everything())))$r.squared
   ) %>%
   left_join(inter_grad, by=c("Target")) %>%
-  mutate(label = paste("y =", round(slope,2), "x +", round(intercept, 2)))
+  mutate(label = paste("y =", round(slope,2), "x +", round(intercept, 2), "\nR² =", round(r_squared, 3)))
 
 graph <- ggplot(std_data_hybrid, aes(x=log_C0, y = Cq, color = Target)) +
   theme_classic() + 
@@ -209,7 +215,7 @@ ggsave(
   units = "in"
 )
 
-# Also make a little standard curve efficiency comparison - probably wont make it to the final paper since its kinda useless
+# Also make a little Standard Curve Efficiency Comparison - probably wont make it
 efficiency_plot <- ggplot(inter_grad, aes(x = Target, y = abs(slope), fill = Target)) +
   geom_col() +
   geom_hline(yintercept = 3.32, linetype = "dashed", color = "red") +
@@ -220,7 +226,7 @@ efficiency_plot
 
 ggsave(
   filename = paste("ICA_std_plot_efficiency.png", sep=""), 
-  plot = heatmap,
+  plot = efficiency_plot,
   dpi = 300,
   width = 12.5,
   height = 6.5,
@@ -284,6 +290,70 @@ cdna_data_with_risk_levels_t2 <- cdna_risk_joiner(cdna_data_t2, ntc_risk_assessm
 
 cdna_with_z_t1 <- cdna_z_score_assigner(cdna_data_with_risk_levels_t1)
 cdna_with_z_t2 <- cdna_z_score_assigner(cdna_data_with_risk_levels_t2)
+
+#11.5 Make cool kaplein meier curve since I forgot to do it
+
+cdna_survival_results <- cdna_data_t2 %>%
+
+  group_by(Target, Sample) %>%
+  do({
+    surv_obj <- Surv(.$Cq, .$Censored == FALSE)
+    fit <- survfit(surv_obj ~ 1)
+    tidy_fit <- broom::tidy(fit)
+    
+    # if the survival crosses 0.5 get the survival
+    median_Cq <- if(any(tidy_fit$estimate <= 0.5)) {
+      tidy_fit$time[min(which(tidy_fit$estimate <= 0.5))]
+    } else {
+      NA  # If never crosses 0.5, all samples censored
+    }
+    
+    data.frame(median_Cq_survival = median_Cq, n_censored = sum(.$Censored))
+  })
+
+survival_plot_maker <- function(cdna_data, target_gene) {
+  plot_data <- cdna_data %>%
+    filter(Target == target_gene) %>%
+    mutate(event_occurred = !Censored)  # this makes event become TREU when amplification happened
+  
+  fit <- survfit(Surv(Cq, event_occurred) ~ Sample, data = plot_data)
+  
+  # Create the plot
+  ggsurvplot(fit, data = plot_data, pval = TRUE, conf.int = FALSE,
+    xlab = "Cq Cycles", 
+    ylab = "Probability of No Amplification",
+    title = paste("Amplification Timing for", target_gene),
+    legend.title = "Cell Line",
+    legend.labs = c("AKN1", "CCLP1", "shNOTCH3"),
+    font.main = 24, font.x = 20, font.y = 20, font.legend = 16, font.tickslab = 16, 
+    palette = c("firebrick2", "turquoise2", "palegreen2"),
+    risk.table = FALSE) # this shows a cool table if TRUE
+}
+
+survival_plot_actin <- survival_plot_maker(cdna_data_t2, "ACTIN")
+survival_plot_actin # probably not gonna use this one since it only confirms what we expect. The housekeeping gene to be constnat
+survival_plot_cdh1 <- survival_plot_maker(cdna_data_t2, "CDH1")
+survival_plot_cdh1
+survival_plot_vim <- survival_plot_maker(cdna_data_t2, "VIMENTIN")
+survival_plot_vim
+
+ggsave(
+  filename = paste("ICA_qPCR_kaplein_meier_cdh1.png", sep=""), 
+  plot = survival_plot_cdh1$plot,
+  dpi = 300,
+  width = 15,
+  height = 6.5,
+  units = "in"
+)
+ggsave(
+  filename = paste("ICA_qPCR_kaplein_meier_vim.png", sep=""), 
+  plot = survival_plot_vim$plot,
+  dpi = 300,
+  width = 15,
+  height = 6.5,
+  units = "in"
+)
+
 
 # 12. Remove outliers over z-score threshold for t1. We move the actin to another table then add it to the end of the matching values by Name and Sample
 
@@ -375,26 +445,26 @@ heatmap_ready_outliers_t2 <- heatmap_ready(cdna_flagged_outliers_t2, censor=TRUE
 
 write.csv(heatmap_ready_outliers_t2, "heatmap_ready_outliers_data.csv", row.names = FALSE)
 
-heatmap <- ggplot(heatmap_ready_outliers_t1, # replace this with t2 and update the labels to get the censored data
+heatmap <- ggplot(heatmap_ready_outliers_t2, # replace this with t2 and update the labels to get the censored data
                   aes(x = Sample, y = Name)) +
   geom_tile_pattern(
     aes(fill = outlier_status, pattern = outlier_status, pattern_colour = outlier_status),
     pattern_density = 0.5, pattern_spacing = 0.02, pattern_angle = 45) +
-  scale_fill_manual(values = c("OUTLIER" = "red", "OK" = "green", "Censored" = "grey", "OUTLIER + Censored" = "grey", "CONTAMINATED" = "grey")) +
+  scale_fill_manual(values = c("OUTLIER" = "red", "OK" = "#F0EFEF", "Censored" = "#BDBDBD", "OUTLIER + Censored" = "#BDBDBD", "CONTAMINATED" = "#BDBDBD")) +
   scale_pattern_manual(values = c("OUTLIER" = "none", "OK" = "none", "Censored" = "none", "OUTLIER + Censored" = "stripe", "CONTAMINATED" = "stripe")) +
   scale_pattern_colour_manual(values = c("OUTLIER" = NA, "OK" = NA, "Censored" = NA, "OUTLIER + Censored" = "red", "CONTAMINATED" = "blue")) +
-  theme_minimal() +
-  labs(title = "NTC Contamination Risk Assessment - Undetermined Removed")
+  theme_minimal(base_size = 14) +
+  labs(title = "NTC Contamination Risk Assessment - Undetermined Censored")
 heatmap
 
-ggsave(
-  filename = paste("ICA_Contamination_risk_assessment_t1.png", sep=""), 
-  plot = heatmap,
-  dpi = 300,
-  width = 12.5,
-  height = 6.5,
-  units = "in"
-)
+# ggsave(
+#   filename = paste("ICA_Contamination_risk_assessment_t2.png", sep=""), 
+#   plot = heatmap,
+#   dpi = 300,
+#   width = 15,
+#   height = 6.5,
+#   units = "in"
+# )
 
 # 14. Normalise data to actin in two ways: using standard curve data or just the ΔΔCt method before saving to file
 
@@ -423,6 +493,35 @@ write.csv(cdna_norm_C0_t2, "cdna_normalisation_data_censored.csv", row.names = F
 
 # 15. Generate Fold change data or ΔΔCt 
 
+avg_norm_data <- cdna_norm_C0_t1 %>%
+  group_by(Target, Sample) %>%
+  summarise(
+    mean_Norm_C0 = mean(Norm_C0, na.rm = TRUE),
+    mean_delta_ct = mean(delta_ct, na.rm = TRUE),
+    n = n(),
+    .groups = 'drop'
+  ) %>%
+  ungroup()
+
+# Then calculate fold changes from the averages
+avg_fc <- avg_norm_data %>%
+  select(Target, Sample, mean_Norm_C0, mean_delta_ct) %>%
+  pivot_wider(
+    names_from = Sample,
+    values_from = c(mean_Norm_C0, mean_delta_ct)
+  ) %>%
+  mutate(
+    CCLP1_over_AKN1_FC = mean_Norm_C0_cDNA2 / mean_Norm_C0_cDNA1,
+    shCCLP1_over_AKN1_FC = mean_Norm_C0_cDNA3 / mean_Norm_C0_cDNA1,
+    ssCCLP1_over_CCLP1_FC = mean_Norm_C0_cDNA3 / mean_Norm_C0_cDNA2,
+    
+    CCLP1_over_AKN1_deltc = 2^-(mean_delta_ct_cDNA2 - mean_delta_ct_cDNA1),
+    shCCLP1_over_AKN1_deltc = 2^-(mean_delta_ct_cDNA3 - mean_delta_ct_cDNA1),
+    ssCCLP1_over_CCLP1_deltc = 2^-(mean_delta_ct_cDNA3 - mean_delta_ct_cDNA2)
+  )
+
+print(avg_fc)
+
 find_FC_cdelta <- function(cdna_norm_C0) {
   cell_compare_FC_cdelta <- cdna_norm_C0 %>%
     mutate(rep = gsub("cDNA ", "", Sample)) %>%
@@ -447,6 +546,18 @@ find_FC_cdelta <- function(cdna_norm_C0) {
 }
 cell_compare_FC_cdelta_t1 <- find_FC_cdelta(cdna_norm_C0_t1)
 cell_compare_FC_cdelta_t2 <- find_FC_cdelta(cdna_norm_C0_t2)
+
+fc_summary_t1 <- cell_compare_FC_cdelta_t1 %>%
+  summarise(
+    avg_CCLP1_over_AKN1_FC = mean(CCLP1_over_AKN1_FC, na.rm = TRUE),
+    avg_shCCLP1_over_AKN1_FC = mean(shCCLP1_over_AKN1_FC, na.rm = TRUE),
+    avg_ssCCLP1_over_CCLP1_FC = mean(ssCCLP1_over_CCLP1_FC, na.rm = TRUE),
+    avg_CCLP1_over_AKN1_deltc = mean(CCLP1_over_AKN1_deltc, na.rm = TRUE),
+    avg_shCCLP1_over_AKN1_deltc = mean(shCCLP1_over_AKN1_deltc, na.rm = TRUE),
+    avg_ssCCLP1_over_CCLP1_deltc = mean(ssCCLP1_over_CCLP1_deltc, na.rm = TRUE)
+  )
+
+print(fc_summary_t1)
 
 #write.csv(cell_compare_FC_cdelta_t1, "cdna_fold_change_deltac.csv", row.names = FALSE)
 
@@ -525,17 +636,17 @@ violin_plot_maker <- function(cdna_norm_C0, Gene_Target, labs_title) {
 
 # When printing the graphs, you may see a warning that some plots aren't being drawn
 # This is fine, these are the results that either the actin or cdh1/vim data was an outlier and removed.
-# If the actin was removed, all of its cDNA x counterparts cannot give a normalised datapoint so are just NA
-violin_plot_vim_t1 <- violin_plot_maker(cdna_norm_C0_t1, "VIMENTIN", "Normalised C0 Violin Plot - Undetermined Removed")
+# If the actin was removed, all of its cDNA cannot give a normalised datapoint
+violin_plot_vim_t1 <- violin_plot_maker(cdna_norm_C0_t1, "VIMENTIN", "Vimentin Expression - Undetermined Removed")
 violin_plot_vim_t1$violin_plot
 
-violin_plot_vim_t2 <- violin_plot_maker(cdna_norm_C0_t2, "VIMENTIN", "Normalised C0 Violin Plot - Censored data")
+violin_plot_vim_t2 <- violin_plot_maker(cdna_norm_C0_t2, "VIMENTIN", "Vimentin Expression - Censored data")
 violin_plot_vim_t2$violin_plot
 
-violin_plot_cdh1_t1 <- violin_plot_maker(cdna_norm_C0_t1, "CDH1", "Normalised C0 Violin Plot - Undetermined Removed")
+violin_plot_cdh1_t1 <- violin_plot_maker(cdna_norm_C0_t1, "CDH1", "CDH1 Expression - Undetermined Removed")
 violin_plot_cdh1_t1$violin_plot
 
-violin_plot_cdh1_t2 <- violin_plot_maker(cdna_norm_C0_t2, "CDH1", "Normalised C0 Violin Plot - Censored data")
+violin_plot_cdh1_t2 <- violin_plot_maker(cdna_norm_C0_t2, "CDH1", "CDH1 Expression - Censored data")
 violin_plot_cdh1_t2$violin_plot
 
 
@@ -566,5 +677,91 @@ ggsave(
 )
 ggsave(
   filename = paste("violin_plot_t2_vim.png", sep=""), plot = violin_plot_vim_t2$violin_plot, dpi = 300,
+  width = 6.5,height = 6.5,units = "in"
+)
+
+new_violin_plot_maker <- function(cdna_norm_C0, Gene_Target, labs_title, delta=FALSE) {
+  norm_C0_group <- cdna_norm_C0 %>%
+    group_by(Name, Sample) %>%
+    filter(Target == Gene_Target) # Change this to see the log_C0 comparisons made
+
+  # Debug stuff
+  cat("Debug info for", Gene_Target, ":\n")
+  cat("Total rows:", nrow(norm_C0_group), "\n")
+  cat("NA values:", sum(is.na(norm_C0_group$Norm_C0)), "\n")
+
+  if (!delta) {
+  # Stat Tests
+  kruskal_test <- kruskal.test(Norm_C0 ~ Sample, data = norm_C0_group) # Shows is there any difference between cell lines?
+  pairwise_wilcox <- pairwise.wilcox.test(norm_C0_group$Norm_C0,  # Which specific pairs are different?
+                                         norm_C0_group$Sample,
+                                         p.adjust.method = "BH") # Benjamini-Hochberg correction to control the Flase Discovery Rate (FDR)
+  y_column <- "Norm_C0"
+  } else {
+  kruskal_test <- kruskal.test(delta_ct ~ Sample, data = norm_C0_group) # Shows is there any difference between cell lines?
+  pairwise_wilcox <- pairwise.wilcox.test(norm_C0_group$delta_ct,  # Which specific pairs are different?
+                                         norm_C0_group$Sample,
+                                         p.adjust.method = "BH") # Benjamini-Hochberg correction to control the Flase Discovery Rate (FDR)
+  y_column <- "delta_ct"
+  }
+  y_label <- paste(y_column," (log scale)")
+
+  violin_plot <- ggplot(norm_C0_group, aes(x = Sample, y = .data[[y_column]], fill = Sample)) +
+    geom_violin(alpha = 0.9, trim = FALSE) +
+    geom_boxplot(width = 0.2, alpha = 0.5, outlier.shape = NA) +
+    geom_jitter(width = 0.1, alpha = 1, size = 0.01) +
+    theme_classic() + 
+    scale_fill_manual(values = c("cDNA 1" = "firebrick2", "cDNA 2" = "turquoise2", "cDNA 3" = "palegreen2"),
+                      labels = c("cDNA 1" = "AKN1", "cDNA 2" = "CCLP1", "cDNA 3" = "shNOTCH3")) +
+    scale_x_discrete(labels = c("cDNA 1" = "AKN1", "cDNA 2" = "CCLP1", "cDNA 3" = "shNOTCH3")) +
+    scale_y_log10() +
+    ylab(y_label) +
+    labs(title = labs_title) +
+    stat_compare_means(
+      method = "kruskal.test", 
+      label.y = 0.95,
+      label = "p.format"
+    ) +
+    stat_compare_means(
+      comparisons = list(c("cDNA 1", "cDNA 2"), 
+                        c("cDNA 1", "cDNA 3"),
+                        c("cDNA 2", "cDNA 3")),
+      method = "wilcox.test",
+      label = "p.format",
+      tip.length = 0.01
+    )
+
+  return(list(
+    norm_C0_group = norm_C0_group,
+    violin_plot = violin_plot
+  ))
+}
+
+violin_plot_vim_t1_delta <- new_violin_plot_maker(cdna_norm_C0_t1, "VIMENTIN", "Vimentin Expression - Undetermined Removed", delta=TRUE)
+violin_plot_vim_t1_delta$violin_plot
+
+violin_plot_vim_t2_delta <- new_violin_plot_maker(cdna_norm_C0_t2, "VIMENTIN", "Vimentin Expression - Censored data", delta=TRUE)
+violin_plot_vim_t2_delta$violin_plot
+
+violin_plot_cdh1_t1_delta <- new_violin_plot_maker(cdna_norm_C0_t1, "CDH1", "CDH1 Expression - Undetermined Removed", delta=TRUE)
+violin_plot_cdh1_t1_delta$violin_plot
+
+violin_plot_cdh1_t2_delta <- new_violin_plot_maker(cdna_norm_C0_t2, "CDH1", "CDH1 Expression - Censored data", delta=TRUE)
+violin_plot_cdh1_t2_delta$violin_plot
+
+ggsave(
+  filename = paste("violin_plot_t1_cdh1_delta.png", sep=""), plot = violin_plot_cdh1_t1_delta$violin_plot, dpi = 300,
+  width = 6.5,height = 6.5,units = "in"
+)
+ggsave(
+  filename = paste("violin_plot_t2_cdh1_delta.png", sep=""), plot = violin_plot_cdh1_t2_delta$violin_plot, dpi = 300,
+  width = 6.5,height = 6.5,units = "in"
+)
+ggsave(
+  filename = paste("violin_plot_t1_vim_delta.png", sep=""), plot = violin_plot_vim_t1_delta$violin_plot, dpi = 300,
+  width = 6.5,height = 6.5,units = "in"
+)
+ggsave(
+  filename = paste("violin_plot_t2_vim_delta.png", sep=""), plot = violin_plot_vim_t2_delta$violin_plot, dpi = 300,
   width = 6.5,height = 6.5,units = "in"
 )
